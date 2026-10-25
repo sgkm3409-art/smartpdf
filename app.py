@@ -1,114 +1,90 @@
-
 from flask import Flask, request, send_file, render_template
-from PIL import Image
+from PIL import Image, ImageOps, ImageDraw
 from werkzeug.utils import secure_filename
-import os
-import io
+import os, io
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
+os.makedirs('static/uploads', exist_ok=True)
+ALLOWED = {'.jpg', '.jpeg', '.jfif', '.png', '.webp'}
 
-UPLOAD_FOLDER = "static/uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+def open_image(file):
+    ext = os.path.splitext(secure_filename(file.filename or ''))[1].lower()
+    if ext not in ALLOWED: raise ValueError('Please use a JPG, PNG, or WEBP image.')
+    im = Image.open(file.stream); im = ImageOps.exif_transpose(im); im.load(); return im
 
+@app.errorhandler(413)
+def too_large(_): return 'File is too large. Please upload a file under 20 MB.', 413
 
-@app.route("/")
-def home():
-    return render_template("index.html")
+@app.route('/')
+def home(): return render_template('index.html')
 
+@app.route('/convert-page')
+def convert_page(): return render_template('convert.html')
 
-# Image to PDF
-@app.route("/convert", methods=["POST"])
+@app.route('/convert', methods=['POST'])
 def convert():
-    files = request.files.getlist("images")
-
-    if not files or files[0].filename == "":
-        return "Please select at least one image.", 400
-
-    images = []
-
+    files = request.files.getlist('images')
+    if not files or not any(f.filename for f in files): return 'Please select at least one image.', 400
+    images=[]
     try:
-        for file in files:
-            image = Image.open(file).convert("RGB")
-            images.append(image)
-
-        pdf_path = os.path.join(UPLOAD_FOLDER, "converted.pdf")
-
-        images[0].save(
-            pdf_path,
-            save_all=True,
-            append_images=images[1:]
-        )
-
-        return send_file(
-            pdf_path,
-            as_attachment=True,
-            download_name="converted.pdf"
-        )
-
-    except Exception:
-        return "Unable to convert the selected images.", 400
-
+        for f in files:
+            if f.filename:
+                with open_image(f) as im: images.append(im.convert('RGB'))
+        if not images: return 'Please select at least one valid image.', 400
+        out=io.BytesIO(); images[0].save(out, format='PDF', save_all=True, append_images=images[1:]); out.seek(0)
+        return send_file(out, mimetype='application/pdf', as_attachment=True, download_name='smartpdf-converted.pdf')
+    except Exception as e: return (str(e) if isinstance(e, ValueError) else 'Unable to convert selected images.'), 400
     finally:
-        for image in images:
-            image.close()
+        for im in images: im.close()
 
+@app.route('/compress')
+def compressor(): return render_template('compress.html')
 
-# Image Compressor Page
-@app.route("/compress")
-def compressor():
-    return render_template("compress.html")
-
-
-# Compress Image and Download as JPG
-@app.route("/compress-image", methods=["POST"])
+@app.route('/compress-image', methods=['POST'])
 def compress_image():
-    file = request.files.get("image")
-
-    if not file or not file.filename:
-        return "Please select an image.", 400
-
+    f=request.files.get('image')
+    if not f or not f.filename: return 'Please select an image.', 400
     try:
-        quality = int(request.form.get("quality", 60))
-        quality = max(10, min(95, quality))
-
-        with Image.open(file) as original:
-            image = original.copy()
-
-        # JPG does not support transparency.
-        # Place transparent areas on a white background.
-        if image.mode in ("RGBA", "LA") or (
-            image.mode == "P" and "transparency" in image.info
-        ):
-            image = image.convert("RGBA")
-            background = Image.new("RGB", image.size, "white")
-            background.paste(image, mask=image.getchannel("A"))
-            image.close()
-            image = background
+        q=max(10,min(95,int(request.form.get('quality',60))))
+        with open_image(f) as original: im=original.copy()
+        if im.mode in ('RGBA','LA') or (im.mode=='P' and 'transparency' in im.info):
+            rgba=im.convert('RGBA'); bg=Image.new('RGB',rgba.size,'white'); bg.paste(rgba,mask=rgba.getchannel('A')); rgba.close(); im.close(); im=bg
         else:
-            image = image.convert("RGB")
+            converted=im.convert('RGB'); im.close(); im=converted
+        out=io.BytesIO(); im.save(out,format='JPEG',quality=q,optimize=True); im.close(); out.seek(0)
+        return send_file(out,mimetype='image/jpeg',as_attachment=True,download_name='compressed-image.jpg')
+    except Exception as e: return (str(e) if isinstance(e,ValueError) else 'Unable to compress this image.'),400
 
-        output = io.BytesIO()
+@app.route('/passport')
+def passport(): return render_template('passport.html')
 
-        image.save(
-            output,
-            format="JPEG",
-            quality=quality,
-            optimize=True
-        )
-        image.close()
+@app.route('/passport-pdf', methods=['POST'])
+def passport_pdf():
+    f=request.files.get('image')
+    if not f or not f.filename: return 'Please upload a photo.',400
+    try:
+        with open_image(f) as original: im=original.convert('RGB')
+        wmm=float(request.form.get('width_mm',35)); hmm=float(request.form.get('height_mm',45)); copies=int(request.form.get('copies',8)); paper=request.form.get('paper','4x6')
+        if not (15<=wmm<=100 and 15<=hmm<=100): return 'Photo dimensions must be between 15 and 100 mm.',400
+        if copies not in {1,4,8,10,12,16,20}: return 'Choose a supported number of copies.',400
+        if paper not in {'a4','4x6'}: return 'Choose A4 or 4×6 inch paper.',400
+        dpi=300; pw=round(wmm/25.4*dpi); ph=round(hmm/25.4*dpi)
+        sw,sh=(round(210/25.4*dpi),round(297/25.4*dpi)) if paper=='a4' else (4*dpi,6*dpi)
+        photo=ImageOps.fit(im,(pw,ph),method=Image.Resampling.LANCZOS,centering=(.5,.35)); im.close()
+        margin=round(3/25.4*dpi); gap=round(3/25.4*dpi); cols=max(1,(sw-2*margin+gap)//(pw+gap)); rows=max(1,(sh-2*margin+gap)//(ph+gap)); perpage=cols*rows
+        pages=[]; remaining=copies
+        while remaining>0:
+            page=Image.new('RGB',(sw,sh),'white'); draw=ImageDraw.Draw(page); count=min(remaining,perpage)
+            for i in range(count):
+                x=margin+(i%cols)*(pw+gap); y=margin+(i//cols)*(ph+gap); page.paste(photo,(x,y)); draw.rectangle((x,y,x+pw-1,y+ph-1),outline=(205,213,225),width=2)
+            pages.append(page); remaining-=count
+        out=io.BytesIO(); pages[0].save(out,format='PDF',save_all=True,append_images=pages[1:],resolution=dpi); out.seek(0); photo.close()
+        for page in pages: page.close()
+        return send_file(out,mimetype='application/pdf',as_attachment=True,download_name='smartpdf-photo-sheet.pdf')
+    except Exception as e: return (str(e) if isinstance(e,ValueError) else 'Unable to create the photo sheet. Check the image and settings.'),400
 
-        output.seek(0)
+@app.route('/enhancer')
+def enhancer(): return render_template('enhancer.html')
 
-        return send_file(
-            output,
-            mimetype="image/jpeg",
-            as_attachment=True,
-            download_name="compressed-image.jpg"
-        )
-
-    except Exception:
-        return "Unable to compress this image. Please select a valid image.", 400
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
+if __name__=='__main__': app.run(debug=True)
